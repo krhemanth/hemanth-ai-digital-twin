@@ -1,0 +1,14 @@
+.env
+.env.*
+!.env.example
+gmail_client_secret.json
+gmail_token.json
+browser_chats.json
+contact_requests.json
+emails.txt
+unknown_questions.txt
+__pycache__/
+*.py[cod]
+*.tmp
+.git/
+.gitignore

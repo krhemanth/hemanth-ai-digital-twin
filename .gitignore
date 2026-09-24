@@ -1,0 +1,10 @@
+.env
+gmail_client_secret.json
+gmail_token.json
+browser_chats.json
+contact_requests.json
+emails.txt
+unknown_questions.txt
+*.tmp
+__pycache__/
+*.py[cod]

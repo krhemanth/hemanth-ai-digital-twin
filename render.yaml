@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: hemanth-ai-digital-twin
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-5.4-mini
+      - key: OPENAI_GUARD_MODEL
+        value: gpt-5.4-nano
+      - key: PUSHOVER_USER
+        sync: false
+      - key: PUSHOVER_TOKEN
+        sync: false
+      - key: OWNER_EMAIL
+        sync: false
+      - key: GMAIL_OAUTH_TOKEN_JSON
+        sync: false
+      - key: GMAIL_ALLOW_INTERACTIVE_OAUTH
+        value: "false"
+      - key: GRADIO_INBROWSER
+        value: "false"
+      - key: GRADIO_SHARE
+        value: "false"
