@@ -534,7 +534,9 @@ def fetch_hemanth_reply(request_id: str) -> str | None:
         _gmail_auth_warning_shown = False
         notification_delivery = request_data.get("notification_delivery") or {}
         notification_gmail_id = notification_delivery.get("gmail_message_id")
-        query = f'from:{owner} subject:"Twin request {request_id}"'
+        # Search only messages the owner actually sent. Gmail drafts have an
+        # underlying message and can otherwise appear while the owner is typing.
+        query = f'in:sent from:{owner} subject:"Twin request {request_id}"'
         message_refs = service.users().messages().list(
             userId="me", q=query, maxResults=5
         ).execute().get("messages", [])
@@ -545,6 +547,9 @@ def fetch_hemanth_reply(request_id: str) -> str | None:
             raw_message = service.users().messages().get(
                 userId="me", id=item["id"], format="raw"
             ).execute()
+            label_ids = set(raw_message.get("labelIds") or [])
+            if "SENT" not in label_ids or "DRAFT" in label_ids:
+                continue
             raw = base64.urlsafe_b64decode(raw_message["raw"] + "==")
             received = email_parser.message_from_bytes(raw)
             sender = parseaddr(received.get("From", ""))[1].lower()
@@ -567,10 +572,8 @@ def fetch_hemanth_reply(request_id: str) -> str | None:
                 _reply_candidate_cache.pop(request_id, None)
             return None
 
-        # Gmail can briefly expose an in-progress mobile/web reply (for example,
-        # just "M") before the complete message has synchronized. Require the
-        # exact body to remain unchanged for a short interval before displaying
-        # or saving it as Hemanth's final answer.
+        # Even sent messages can take a moment to finish synchronizing across
+        # Gmail. Require the exact body to remain unchanged briefly.
         candidate = max(replies, key=len)
         return _stable_reply_candidate(request_id, candidate)
     except HttpError as error:
