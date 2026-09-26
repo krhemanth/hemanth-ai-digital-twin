@@ -326,6 +326,39 @@ button.submit:hover,
 ::selection { background: var(--twin-cyan); color: #06111a; }
 
 @media (max-width: 680px) {
+  /* Mobile browsers can apply Gradio's dark text variables inside Markdown
+     bubbles even when the page shell is forced to light mode. */
+  gradio-app,
+  .gradio-container,
+  .gradio-container .main,
+  .gradio-container .prose,
+  .chatbot,
+  .chatbot.block {
+    color: #111b21 !important;
+    -webkit-text-fill-color: #111b21 !important;
+  }
+  .chatbot .message,
+  .chatbot .message *,
+  .chatbot .message-bubble,
+  .chatbot .message-bubble *,
+  .chatbot .bubble,
+  .chatbot .bubble * {
+    color: #111b21 !important;
+    -webkit-text-fill-color: #111b21 !important;
+    text-shadow: none !important;
+  }
+  .chatbot .message a,
+  .chatbot .message-bubble a,
+  .chatbot .bubble a {
+    color: #008069 !important;
+    -webkit-text-fill-color: #008069 !important;
+  }
+  textarea,
+  input[type="text"] {
+    color: #111b21 !important;
+    -webkit-text-fill-color: #111b21 !important;
+    background: #ffffff !important;
+  }
   .gradio-container { padding: 22px 12px 34px !important; }
   .chatbot, .chatbot.block { min-height: 68vh !important; border-radius: 15px !important; }
   .message-row .message,
