@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import os
 import re
 import threading
@@ -16,8 +17,8 @@ from pathlib import Path
 import gradio as gr
 import uvicorn
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Request as FastAPIRequest
+from fastapi.responses import HTMLResponse, PlainTextResponse
 from openai import OpenAI
 
 from context import get_profile_context, get_system_prompt
@@ -31,11 +32,13 @@ from tools import (
     mark_chat_answer_displayed,
     mark_request_awaiting_visitor_email,
     normalize_history,
+    process_whatsapp_webhook,
     record_contact_request,
     record_unknown_question,
-    route_request_to_visitor_email,
+    record_visitor_contact_details,
     start_reply_watcher,
     tools,
+    whatsapp_signature_is_valid,
 )
 
 
@@ -60,10 +63,10 @@ RATE_LIMIT_WINDOW_SECONDS = 120
 RATE_LIMIT_WINDOW_MAX = 8
 RATE_LIMIT_HOUR_MAX = 30
 HUMAN_REPLY_POLL_SECONDS = 10
-HUMAN_REPLY_WAIT_SECONDS = 5 * 60
+HUMAN_REPLY_WAIT_SECONDS = 2 * 60
 HUMAN_REPLY_STATUS = (
-    "I emailed the real Hemanth and sent him a Pushover notification. I’ll check "
-    "for his response every 10 seconds for the next 5 minutes."
+    "I don’t have a verified answer, so I’ve reached out to the real Hemanth on "
+    "WhatsApp. Please give him a minute; I’ll show his response here."
 )
 BROWSER_CHATS_FILE = DATA_DIR / "browser_chats.json"
 BROWSER_CHATS_LOCK = threading.RLock()
@@ -114,6 +117,7 @@ HEMANTH_REFERENCE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 VISITOR_EMAIL_PATTERN = re.compile(r"[^\s@]+@[^\s@]+\.[^\s@]+")
+VISITOR_PHONE_PATTERN = re.compile(r"(?:\+?\d[\s().-]*){7,15}")
 CONTACT_CONSENT_PATTERN = re.compile(
     r"^\s*(?:yes(?:\s+please)?(?:\s+(?:check|ask|contact|email|reach\s+out)"
     r"(?:\s+with|\s+to)?\s+(?:hemanth|him))?|please do|sure|okay|ok|go ahead|"
@@ -139,9 +143,8 @@ ACTIVE_BROWSER_SESSIONS: dict[str, str] = {}
 ACTIVE_BROWSER_SESSIONS_LOCK = threading.Lock()
 VISITOR_NAMES: dict[str, str] = {}
 openai = OpenAI()
-# Human follow-up email is initiated only by the deterministic consent branch
-# after an explicit yes. The model may record an unknown question, but it cannot
-# send the follow-up notification itself.
+# Human follow-up is initiated only by deterministic application code. The model
+# may record an unknown question, but it cannot send WhatsApp notifications itself.
 CHAT_TOOLS = [
     tool
     for tool in tools
@@ -165,7 +168,10 @@ def session_identity(request: gr.Request | None) -> str:
 
 
 def browser_identity(request: gr.Request | None) -> str:
-    """Stable, non-plaintext browser key that survives a page refresh."""
+    """Return a per-browser-session key, with a hashed network fallback."""
+    session_hash = getattr(request, "session_hash", None) if request else None
+    if session_hash:
+        return hashlib.sha256(f"session:{session_hash}".encode("utf-8")).hexdigest()
     client = getattr(request, "client", None) if request else None
     host = getattr(client, "host", "") if client else ""
     headers = getattr(request, "headers", {}) if request else {}
@@ -490,8 +496,6 @@ def monitor_human_reply(
     question: str,
     session_key: str,
     visitor_name: str,
-    visitor_email: str | None = None,
-    visitor_details: str = "",
     wait_seconds: int = HUMAN_REPLY_WAIT_SECONDS,
 ):
     status = HUMAN_REPLY_STATUS
@@ -525,33 +529,17 @@ def monitor_human_reply(
         # invisible markers made Gradio repaint and briefly erase the message.
 
     mark_request_awaiting_visitor_email(request_id)
-    if visitor_email:
-        route_request_to_visitor_email(
-            request_id,
-            visitor_email,
-            visitor_name,
-            visitor_details,
-        )
-        with PENDING_FOLLOWUP_LOCK:
-            PENDING_FOLLOWUPS.pop(session_key, None)
-        yield status + (
-            f"\n\nIt looks like Hemanth is busy right now. Your details are recorded, "
-            f"and he will respond to **{visitor_email}** by the end of the day. "
-            "Is there anything else I can help you with?"
-        )
-        return
-
     with PENDING_FOLLOWUP_LOCK:
         PENDING_FOLLOWUPS[session_key] = {
             "question": question,
             "request_id": request_id,
             "created_at": time.monotonic(),
             "name": visitor_name,
-            "awaiting_visitor_email": True,
+            "awaiting_visitor_contact": True,
         }
     yield status + (
-        "\n\nIt looks like Hemanth is busy right now. Please drop your name and "
-        "email address. Hemanth will respond to your personal email by the end of the day."
+        "\n\nThe real Hemanth has not responded within two minutes. Please leave your "
+        "name and preferred contact details, and he will contact you when available."
     )
 
 
@@ -585,9 +573,8 @@ def _chat_impl(message, history, request: gr.Request):
             with PENDING_FOLLOWUP_LOCK:
                 PENDING_FOLLOWUPS[session_key] = pending
 
-    # A browser refresh creates a new Gradio session. Reattach the newest
-    # persisted follow-up using the stable visitor identity so waiting, timeout,
-    # and completed replies are not lost with the old websocket connection.
+    # Reattach the newest persisted follow-up for this browser session so a
+    # temporary websocket reconnect does not lose a waiting or completed reply.
     if not pending:
         recovered = latest_followup_for_visitor(browser_identity(request))
         if recovered:
@@ -607,7 +594,7 @@ def _chat_impl(message, history, request: gr.Request):
                     "request_id": request_id,
                     "created_at": time.monotonic(),
                     "name": str(recovered.get("name") or "Name not provided"),
-                    "awaiting_visitor_email": True,
+                    "awaiting_visitor_contact": True,
                 }
                 with PENDING_FOLLOWUP_LOCK:
                     PENDING_FOLLOWUPS[session_key] = pending
@@ -636,64 +623,59 @@ def _chat_impl(message, history, request: gr.Request):
                 )
                 return
 
-    if pending and pending.get("awaiting_visitor_email"):
-        email_match = VISITOR_EMAIL_PATTERN.search(message)
-        introduction = VISITOR_INTRO_PATTERN.fullmatch(message)
-        if introduction and not email_match:
-            name = " ".join(introduction.group(1).strip().split()).rstrip(".!,'-")
-            VISITOR_NAMES[session_key] = name
-            with PENDING_FOLLOWUP_LOCK:
-                pending["name"] = name
-            yield (
-                f"Thanks, {name}. Please send your email address so Hemanth can "
-                "respond to you personally by the end of the day."
-            )
+    if pending and pending.get("awaiting_visitor_name"):
+        name = visitor_name_from_message(message)
+        if not name:
+            yield "Please tell me the name I should include when I contact Hemanth."
             return
-        if not email_match:
-            yield (
-                "Please send your name and email address. Hemanth will respond to "
-                "your personal email by the end of the day."
-            )
+        VISITOR_NAMES[session_key] = name
+        result = record_contact_request(
+            question=str(pending["question"]), reply_channel="chat", name=name,
+            recent_questions=list(pending.get("recent_questions") or [pending["question"]]),
+            conversation=str(pending.get("conversation") or pending["question"]),
+            visitor_key=browser_identity(request),
+        )
+        if not result.get("delivered"):
+            yield "I saved your question, but I could not reach Hemanth on WhatsApp. Please try again shortly."
             return
-
-        visitor_email = email_match.group(0).rstrip(".,;:!?")
-        name = str(
-            pending.get("name")
-            or VISITOR_NAMES.get(session_key)
-            or "Name not provided"
-        )
-        candidate_name = visitor_name_from_message(message, email_match.group(0))
-        if candidate_name:
-            name = candidate_name
-            VISITOR_NAMES[session_key] = name
-
-        result = route_request_to_visitor_email(
-            str(pending["request_id"]), visitor_email, name, message
-        )
-        if result.get("recorded"):
-            with PENDING_FOLLOWUP_LOCK:
-                PENDING_FOLLOWUPS.pop(session_key, None)
-            notification = result.get("contact_notification") or {}
-            email_sent = bool((notification.get("email_delivery") or {}).get("delivered"))
-            push_sent = bool((notification.get("pushover") or {}).get("delivered"))
-            if email_sent and push_sent:
-                delivery_note = "Hemanth was notified by email and Pushover."
-            elif push_sent:
-                delivery_note = "Email delivery had an issue, but Hemanth was notified by Pushover."
-            elif email_sent:
-                delivery_note = "Hemanth was notified by email."
-            else:
-                delivery_note = "Your details were saved, but notification delivery had an issue."
-            yield (
-                f"Thanks, {name}. Your details are recorded. {delivery_note} "
-                f"He will respond to **{visitor_email}** by the end "
-                "of the day. Is there anything else I can help you with?"
-            )
-        else:
-            yield "I couldn't save that email address. Please check it and try again."
+        request_id = str(result["request_id"])
+        with PENDING_FOLLOWUP_LOCK:
+            pending.update({"request_id": request_id, "name": name, "awaiting_visitor_name": False})
+        yield from monitor_human_reply(request_id, str(pending["question"]), session_key, name)
         return
 
-    if pending and pending.get("awaiting_contact_consent"):
+    if pending and pending.get("awaiting_visitor_contact"):
+        name = str(pending.get("name") or VISITOR_NAMES.get(session_key) or "Name not provided")
+        looks_like_question = bool(
+            "?" in message
+            or re.match(r"^\s*(?:who|what|when|where|why|how|is|are|can|could|would|does|do)\b", message, re.IGNORECASE)
+        )
+        supplied_name = None if looks_like_question else visitor_name_from_message(message)
+        has_contact = bool(
+            VISITOR_EMAIL_PATTERN.search(message)
+            or VISITOR_PHONE_PATTERN.search(message)
+            or re.search(r"\b(?:contact|reach me|linkedin|whatsapp)\b", message, re.IGNORECASE)
+        )
+        if supplied_name and not has_contact:
+            VISITOR_NAMES[session_key] = supplied_name
+            with PENDING_FOLLOWUP_LOCK:
+                pending["name"] = supplied_name
+            yield f"Thanks, {supplied_name}. Please also provide an email address, phone number, or preferred way for Hemanth to contact you."
+            return
+        if has_contact:
+            result = record_visitor_contact_details(str(pending["request_id"]), name, message)
+            if result.get("recorded"):
+                with PENDING_FOLLOWUP_LOCK:
+                    PENDING_FOLLOWUPS.pop(session_key, None)
+                yield f"Thanks, {name}. I saved your contact details. The real Hemanth will contact you when he is available."
+            else:
+                yield "I couldn’t save those contact details. Please try again."
+            return
+        with PENDING_FOLLOWUP_LOCK:
+            PENDING_FOLLOWUPS.pop(session_key, None)
+        pending = None
+
+    if False and pending and pending.get("awaiting_contact_consent"):  # Legacy email flow.
         email_match = VISITOR_EMAIL_PATTERN.search(message)
         supplied_name = visitor_name_from_message(
             message, email_match.group(0) if email_match else None
@@ -803,19 +785,35 @@ def _chat_impl(message, history, request: gr.Request):
 
     if TIME_SENSITIVE_AVAILABILITY_PATTERN.search(message):
         record_unknown_question(message)
+        visitor_name = VISITOR_NAMES.get(session_key, "Name not provided")
+        recent_questions = recent_visitor_messages(history, message, limit=4)
+        conversation = conversation_text(history, message)
+        if visitor_name == "Name not provided":
+            with PENDING_FOLLOWUP_LOCK:
+                PENDING_FOLLOWUPS[session_key] = {
+                    "question": message, "created_at": time.monotonic(), "name": visitor_name,
+                    "awaiting_visitor_name": True, "recent_questions": recent_questions,
+                    "conversation": conversation, "time_sensitive": True,
+                }
+            yield "I don’t have a current verified answer, so I’m going to reach out to the real Hemanth. Before I do, what name should I use for you?"
+            return
+        result = record_contact_request(
+            question=message, reply_channel="chat", name=visitor_name,
+            recent_questions=recent_questions, conversation=conversation,
+            visitor_key=browser_identity(request),
+        )
+        if not result.get("delivered"):
+            yield "I saved your question, but I could not reach Hemanth on WhatsApp."
+            return
+        request_id = str(result["request_id"])
         with PENDING_FOLLOWUP_LOCK:
             PENDING_FOLLOWUPS[session_key] = {
-                "question": message,
+                "question": message, "request_id": request_id,
                 "created_at": time.monotonic(),
-                "name": VISITOR_NAMES.get(session_key, "Name not provided"),
-                "awaiting_contact_consent": True,
+                "name": visitor_name,
                 "time_sensitive": True,
             }
-        yield (
-            "Hemanth’s availability changes in real time, so I won’t rely on an older "
-            "answer. Would you like me to reach out to the real Hemanth by email and "
-            "get his current answer here in chat? Please reply **yes** or **no**."
-        )
+        yield from monitor_human_reply(request_id, message, session_key, visitor_name)
         return
 
     if False and pending and re.fullmatch(  # Legacy channel-choice flow is disabled.
@@ -975,59 +973,36 @@ def _chat_impl(message, history, request: gr.Request):
             print(f"Unable to escalate blocked output: {error}")
 
     if unknown_recorded:
-        answer = (
-            "I don’t know the answer to that from Hemanth’s verified information. "
-            "Would you like me to reach out to the real Hemanth by email and get the "
-            "answer here in chat? Please reply **yes** or **no**."
+        visitor_name = VISITOR_NAMES.get(session_key, "Name not provided")
+        recent_questions = recent_visitor_messages(history, message, limit=4)
+        conversation = conversation_text(history, message)
+        if visitor_name == "Name not provided":
+            with PENDING_FOLLOWUP_LOCK:
+                PENDING_FOLLOWUPS[session_key] = {
+                    "question": message, "created_at": time.monotonic(), "name": visitor_name,
+                    "awaiting_visitor_name": True, "recent_questions": recent_questions,
+                    "conversation": conversation,
+                }
+            yield "I don’t have a verified answer, so I’m going to reach out to the real Hemanth. Before I do, what name should I use for you?"
+            return
+        result = record_contact_request(
+            question=message, reply_channel="chat", name=visitor_name,
+            recent_questions=recent_questions, conversation=conversation,
+            visitor_key=browser_identity(request),
         )
-
-    yield answer
-
-    if request_id and reply_channel == "chat" and reply_tracking_ready:
-        for _ in range(30):
-            time.sleep(10)
-            owner_answer = fetch_hemanth_reply(request_id)
-            if owner_answer:
-                completed = complete_request(
-                    request_id, owner_answer
-                )
-                if completed and completed.get("answer"):
-                    with PENDING_FOLLOWUP_LOCK:
-                        PENDING_FOLLOWUPS.pop(session_key, None)
-                    yield answer + f"\n\n### Here is the response from the actual Hemanth\n{completed['answer']}"
-                else:
-                    yield (
-                        answer
-                        + "\n\nHemanth replied, but I could not match the response to "
-                        "the saved request. Please try again."
-                    )
-                return
-        mark_request_awaiting_visitor_email(request_id)
+        if not result.get("delivered"):
+            yield "I saved your question, but I could not reach Hemanth on WhatsApp. Please try again shortly."
+            return
+        request_id = str(result["request_id"])
         with PENDING_FOLLOWUP_LOCK:
             PENDING_FOLLOWUPS[session_key] = {
-                "question": message,
-                "request_id": request_id,
-                "created_at": time.monotonic(),
-                "name": VISITOR_NAMES.get(session_key, "Name not provided"),
-                "awaiting_visitor_email": True,
+                "question": message, "request_id": request_id,
+                "created_at": time.monotonic(), "name": visitor_name,
             }
-        yield answer + (
-            "\n\nIt seems Hemanth is busy right now. Please drop your name and email "
-            "address. Hemanth will respond to your personal email by the end of the day."
-        )
+        yield from monitor_human_reply(request_id, message, session_key, visitor_name)
         return
 
-    if unknown_recorded and request_id:
-        mark_request_awaiting_visitor_email(request_id)
-        with PENDING_FOLLOWUP_LOCK:
-            pending = PENDING_FOLLOWUPS.get(session_key, {})
-            pending["awaiting_visitor_email"] = True
-            pending["request_id"] = request_id
-            PENDING_FOLLOWUPS[session_key] = pending
-        yield answer + (
-            "\n\nI could not start the email reply monitor. Please drop your name and "
-            "email address so Hemanth can respond personally."
-        )
+    yield answer
 
 
 def chat(message, history, request: gr.Request):
@@ -1148,8 +1123,8 @@ def poll_browser_followup(request: gr.Request):
         mark_request_awaiting_visitor_email(request_id)
         response = (
             f"{HUMAN_REPLY_STATUS}\n\n"
-            "It looks like Hemanth is busy right now. Please drop your name and "
-            "email address. Hemanth will respond to your personal email by the end of the day."
+            "The real Hemanth has not responded within two minutes. Please leave your "
+            "name and preferred contact details, and he will contact you when available."
         )
     else:
         response = HUMAN_REPLY_STATUS
@@ -1259,11 +1234,11 @@ def privacy_policy_html() -> str:
   </ul>
 
   <h2>Service providers and disclosures</h2>
-  <p>Chat content is sent to OpenAI for AI processing. Depending on the feature you request, relevant information may also be processed by Meta and WhatsApp, Google Gmail, Pushover, the email provider, and the application hosting provider (including Render). These providers process information under their own terms and privacy policies. Information is also shared with Hemanth when you explicitly request human assistance or a personal response.</p>
+  <p>Chat content is sent to OpenAI for AI processing. When human assistance is needed, relevant questions, recent conversation context, names, contact details, and replies may also be processed by Meta and WhatsApp. Application data is processed by the hosting provider, including Render when the hosted service is used. These providers process information under their own terms and privacy policies. Information is shared with Hemanth when the application requests a human answer or when you ask for personal contact.</p>
   <p>We do not sell personal information. We may disclose information if required by law, to protect users or the service, or in connection with a legitimate security investigation.</p>
 
   <h2>Storage, security, and retention</h2>
-  <p>Application records are stored in local application storage or an attached hosting volume. Email and notification records may also remain with the relevant communication provider. The application uses access controls and secret-based credentials, but no Internet service can guarantee absolute security.</p>
+  <p>Application records are stored in local application storage or an attached hosting volume. WhatsApp message and notification records may also remain with Meta. The application uses access controls and secret-based credentials, but no Internet service can guarantee absolute security.</p>
   <p>The application does not currently apply a fixed automatic deletion period to saved chats, contact requests, or unanswered questions. Records are retained until they are no longer needed for the purposes described above or are manually deleted in response to a valid request. Hosting environments without persistent storage may erase local records when the service is rebuilt or restarted.</p>
 
   <h2>Your choices and deletion requests</h2>
@@ -1291,6 +1266,31 @@ def create_web_app() -> FastAPI:
     @web_app.get("/privacy-policy/", response_class=HTMLResponse, include_in_schema=False)
     def privacy_policy() -> HTMLResponse:
         return HTMLResponse(privacy_policy_html())
+
+    @web_app.get("/webhook", response_class=PlainTextResponse, include_in_schema=False)
+    async def verify_whatsapp_webhook(request: FastAPIRequest) -> PlainTextResponse:
+        mode = request.query_params.get("hub.mode", "")
+        token = request.query_params.get("hub.verify_token", "")
+        challenge = request.query_params.get("hub.challenge", "")
+        expected = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+        if mode == "subscribe" and expected and hmac.compare_digest(token, expected):
+            return PlainTextResponse(challenge, status_code=200)
+        return PlainTextResponse("Verification failed", status_code=403)
+
+    @web_app.post("/webhook", response_class=PlainTextResponse, include_in_schema=False)
+    async def receive_whatsapp_webhook(request: FastAPIRequest) -> PlainTextResponse:
+        raw_body = await request.body()
+        if not whatsapp_signature_is_valid(raw_body, request.headers.get("X-Hub-Signature-256")):
+            return PlainTextResponse("Invalid signature", status_code=401)
+        try:
+            payload = json.loads(raw_body)
+        except (json.JSONDecodeError, TypeError):
+            return PlainTextResponse("Invalid JSON", status_code=400)
+        results = process_whatsapp_webhook(payload)
+        for result in results:
+            if not result.get("accepted"):
+                print(f"[WhatsApp webhook ignored] {result}")
+        return PlainTextResponse("EVENT_RECEIVED", status_code=200)
 
     demo = create_demo()
     demo = demo.queue(default_concurrency_limit=16, max_size=64)

@@ -25,6 +25,11 @@ files, OAuth tokens, or Pushover credentials.
 - `PUSHOVER_TOKEN`
 - `OWNER_EMAIL`
 - `PRIVACY_CONTACT_EMAIL`: public contact address displayed on the Privacy Policy
+- `WHATSAPP_TOKEN`
+- `WHATSAPP_PHONE_NUMBER_ID`
+- `WHATSAPP_HUMAN_RECIPIENT`
+- `WHATSAPP_VERIFY_TOKEN`
+- `META_APP_SECRET`
 - `GMAIL_OAUTH_TOKEN_JSON`: the complete JSON contents of the locally authorized
   `gmail_token.json` file
 
@@ -49,3 +54,10 @@ The application serves a public Privacy Policy at `/privacy-policy` in both loca
 and hosted environments. Locally, the default URL is
 `http://127.0.0.1:7860/privacy-policy`. On Render, use
 `https://hemanth-ai-digital-twin.onrender.com/privacy-policy` after deployment.
+
+## WhatsApp human follow-up
+
+The main application serves the WhatsApp callback at `/webhook`. On Render, configure
+Meta with `https://hemanth-ai-digital-twin.onrender.com/webhook` and the value of
+`WHATSAPP_VERIFY_TOKEN`. Owner replies must start with the eight-character request
+code included in the notification, for example `4ED37FB0 Your answer`.

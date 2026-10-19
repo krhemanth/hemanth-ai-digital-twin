@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import base64
 import email as email_parser
+import hashlib
+import hmac
 import json
 import os
 import re
@@ -43,6 +45,9 @@ EMAILS_FILE = DATA_DIR / "emails.txt"
 UNKNOWN_QUESTIONS_FILE = DATA_DIR / "unknown_questions.txt"
 EMAIL_PATTERN = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 REQUEST_ID_PATTERN = re.compile(r"\[Twin request ([0-9a-f-]+)\]")
+WHATSAPP_REPLY_PATTERN = re.compile(
+    r"^\s*\[?([0-9A-Fa-f]{8})\]?(?:\s*[:\-])?\s+(.+?)\s*$", re.DOTALL
+)
 TIME_SENSITIVE_QUESTION_PATTERN = re.compile(
     r"\b(?:available|availability|free|quick call|call now|coffee|meet(?:ing)?|"
     r"today|tomorrow|tonight|right now|currently|this (?:morning|afternoon|evening)|"
@@ -271,16 +276,79 @@ def record_user_details(
     with NOTIFICATION_LOCK:
         with EMAILS_FILE.open("a", encoding="utf-8") as file:
             file.write(f"{_utc_now()}\t{name.strip()}\t{email}\t{notes.strip()}\n")
-    pushover_delivery = push(f"Contact from {name}: {email}. Notes: {notes}")
-    email_delivery = notify_user_details_email(email, name.strip(), notes.strip())
+    whatsapp_delivery = send_whatsapp_message(
+        "Digital twin contact request\n"
+        f"Visitor: {name.strip() or 'Name not provided'}\n"
+        f"Email: {email}\n"
+        f"Notes: {notes.strip()}"
+    )
     return {
         "recorded": True,
-        "pushover": pushover_delivery,
-        "email_delivery": email_delivery,
-        "notified": bool(
-            pushover_delivery.get("delivered") or email_delivery.get("delivered")
-        ),
+        "whatsapp_delivery": whatsapp_delivery,
+        "notified": bool(whatsapp_delivery.get("delivered")),
     }
+
+
+def _required_whatsapp_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value or value.startswith(("YOUR_", "PASTE_")):
+        raise RuntimeError(f"Set {name} before using WhatsApp notifications")
+    return value
+
+
+def _normalize_phone_number(number: str) -> str:
+    return "".join(character for character in number if character.isdigit())
+
+
+def send_whatsapp_message(message: str) -> dict[str, Any]:
+    """Send an owner notification through the WhatsApp Cloud API."""
+    try:
+        token = _required_whatsapp_env("WHATSAPP_TOKEN")
+        phone_number_id = _required_whatsapp_env("WHATSAPP_PHONE_NUMBER_ID")
+        recipient = _normalize_phone_number(
+            _required_whatsapp_env("WHATSAPP_HUMAN_RECIPIENT")
+        )
+        api_version = os.getenv("WHATSAPP_API_VERSION", "v26.0")
+        response = requests.post(
+            f"https://graph.facebook.com/{api_version}/{phone_number_id}/messages",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "messaging_product": "whatsapp",
+                "recipient_type": "individual",
+                "to": recipient,
+                "type": "text",
+                "text": {"preview_url": False, "body": message[:4096]},
+            },
+            timeout=30,
+        )
+        if response.ok:
+            message_id = response.json().get("messages", [{}])[0].get("id")
+            return {"delivered": True, "whatsapp_message_id": message_id}
+        try:
+            detail = response.json()
+        except requests.exceptions.JSONDecodeError:
+            detail = response.text
+        return {
+            "delivered": False,
+            "reason": f"Meta API returned HTTP {response.status_code}: {detail}",
+        }
+    except (RuntimeError, requests.RequestException) as error:
+        return {"delivered": False, "reason": str(error)}
+
+
+def whatsapp_signature_is_valid(raw_body: bytes, signature_header: str | None) -> bool:
+    app_secret = os.getenv("META_APP_SECRET", "").strip()
+    if not app_secret or app_secret.startswith("PASTE_"):
+        return True
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    expected = "sha256=" + hmac.new(
+        app_secret.encode("utf-8"), raw_body, hashlib.sha256
+    ).hexdigest()
+    return hmac.compare_digest(expected, signature_header)
 
 
 def record_unknown_question(question: str) -> dict[str, Any]:
@@ -298,28 +366,18 @@ def record_unknown_question(question: str) -> dict[str, Any]:
 
 
 def notify_hemanth(request_data: dict[str, Any]) -> dict[str, Any]:
-    channel = "email" if request_data["reply_channel"] == "email" else "the chat window"
     recent_questions = request_data.get("recent_questions") or [request_data["question"]]
-    questions_text = "\n".join(f"- {question}" for question in recent_questions)
-    transcript = request_data.get("conversation") or request_data["question"]
-    message = _owner_message(
-        f"[Twin request {request_data['id']}] Website question",
-        f"Visitor: {request_data['name']}\n"
-        f"Visitor email: {request_data.get('email') or 'Not supplied'}\n"
-        f"Reply channel: {channel}\n\n"
-        f"Original unanswered question:\n{request_data['question']}\n\n"
-        f"Most recent visitor messages (up to 3):\n{questions_text}\n\n"
-        f"Entire chat transcript:\n{transcript}\n\n"
-        "Reply directly to this email and keep the request code in the subject. "
-        "The twin will save the answer, update summary.txt when appropriate, and route it "
-        "through the visitor's selected channel.",
-        request_data.get("email"),
+    questions_text = "\n".join(
+        f"{index}. {question}" for index, question in enumerate(recent_questions[-4:], 1)
     )
-    if not message:
-        return {"delivered": False, "reason": "Owner email is not configured"}
-    message["Message-ID"] = request_data["notification_message_id"]
-    message["X-Digital-Twin-Notification"] = "true"
-    return deliver(message)
+    reply_code = request_data["reply_code"]
+    return send_whatsapp_message(
+        f"[Twin request {reply_code}]\n"
+        f"Visitor: {request_data['name']}\n\n"
+        f"Current question:\n{request_data['question']}\n\n"
+        f"Recent visitor questions (up to 4):\n{questions_text}\n\n"
+        f"Reply with:\n{reply_code} Your answer"
+    )
 
 
 def record_contact_request(
@@ -331,15 +389,22 @@ def record_contact_request(
     conversation: str | None = None,
     visitor_key: str | None = None,
 ) -> dict[str, Any]:
-    if reply_channel not in {"email", "chat"}:
-        return {"recorded": False, "reason": "Reply channel must be email or chat"}
-    if reply_channel == "email" and (
-        not email or not EMAIL_PATTERN.fullmatch(email.strip())
-    ):
-        return {"recorded": False, "reason": "A valid email is required for an email reply"}
+    if reply_channel != "chat":
+        return {"recorded": False, "reason": "WhatsApp follow-ups return through chat"}
 
+    with REQUEST_LOCK:
+        requests_data = load_requests()
+        existing_codes = {
+            str(item.get("reply_code") or "").upper() for item in requests_data
+        }
+        while True:
+            request_id = str(uuid.uuid4())
+            reply_code = request_id.split("-", 1)[0].upper()
+            if reply_code not in existing_codes:
+                break
     request_data = {
-        "id": str(uuid.uuid4()),
+        "id": request_id,
+        "reply_code": reply_code,
         "created_at": _utc_now(),
         "name": name.strip() or "Name not provided",
         "email": email.strip().lower() if email else None,
@@ -349,7 +414,7 @@ def record_contact_request(
         "reply_channel": reply_channel,
         "visitor_key": visitor_key,
         "chat_wait_deadline": (
-            (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+            (datetime.now(timezone.utc) + timedelta(minutes=2)).isoformat()
             if reply_channel == "chat"
             else None
         ),
@@ -360,29 +425,50 @@ def record_contact_request(
         requests_data.append(request_data)
         save_requests(requests_data)
 
-    email_delivery = notify_hemanth(request_data)
-    pushover_delivery = push(
-        f"Human follow-up requested by {request_data['name']}: {request_data['question']}"
-    )
+    whatsapp_delivery = notify_hemanth(request_data)
     with REQUEST_LOCK:
         requests_data = load_requests()
         stored = next((item for item in requests_data if item["id"] == request_data["id"]), None)
         if stored:
-            stored["notification_delivery"] = email_delivery
-            stored["pushover_delivery"] = pushover_delivery
+            stored["whatsapp_delivery"] = whatsapp_delivery
             save_requests(requests_data)
 
     return {
         "recorded": True,
         "request_id": request_data["id"],
         "reply_channel": reply_channel,
-        "delivered": bool(email_delivery.get("delivered")),
-        "notified": bool(
-            email_delivery.get("delivered") or pushover_delivery.get("delivered")
-        ),
-        "email_delivery": email_delivery,
-        "pushover": pushover_delivery,
+        "reply_code": request_data["reply_code"],
+        "delivered": bool(whatsapp_delivery.get("delivered")),
+        "notified": bool(whatsapp_delivery.get("delivered")),
+        "whatsapp_delivery": whatsapp_delivery,
     }
+
+
+def record_visitor_contact_details(
+    request_id: str, name: str, contact_details: str
+) -> dict[str, Any]:
+    """Attach timeout contact details without changing browser answer routing."""
+    contact_details = contact_details.strip()
+    if not contact_details:
+        return {"recorded": False, "reason": "Contact details are required"}
+    with REQUEST_LOCK:
+        requests_data = load_requests()
+        request_data = next(
+            (item for item in requests_data if item.get("id") == request_id), None
+        )
+        if not request_data:
+            return {"recorded": False, "reason": "The follow-up request was not found"}
+        request_data["name"] = name.strip() or request_data.get("name") or "Name not provided"
+        request_data["visitor_contact_details"] = contact_details
+        request_data["visitor_contact_added_at"] = _utc_now()
+        reply_code = request_data.get("reply_code") or str(request_id)[:8].upper()
+        save_requests(requests_data)
+    delivery = send_whatsapp_message(
+        f"[Contact update {reply_code}]\n"
+        f"Visitor: {name.strip() or 'Name not provided'}\n"
+        f"Contact details: {contact_details}"
+    )
+    return {"recorded": True, "whatsapp_delivery": delivery}
 
 
 def mark_request_awaiting_visitor_email(request_id: str) -> bool:
@@ -517,89 +603,12 @@ def _stable_reply_candidate(request_id: str, candidate: str, now: float | None =
 
 
 def fetch_hemanth_reply(request_id: str) -> str | None:
-    global _gmail_auth_warning_shown, _gmail_retry_after
-    if time.monotonic() < _gmail_retry_after:
-        return None
+    """Read a WhatsApp-completed answer from the persisted request."""
     request_data = next(
         (item for item in load_requests() if item.get("id") == request_id), None
     )
-    owner = os.getenv("OWNER_EMAIL", "").lower()
-    if not request_data or not owner:
-        return None
-    if request_data.get("answered_at") and request_data.get("answer"):
+    if request_data and request_data.get("answered_at") and request_data.get("answer"):
         return str(request_data["answer"])
-    try:
-        service = gmail_service()
-        _gmail_auth_warning_shown = False
-        notification_delivery = request_data.get("notification_delivery") or {}
-        notification_gmail_id = notification_delivery.get("gmail_message_id")
-        # Search only messages the owner actually sent. Gmail drafts have an
-        # underlying message and can otherwise appear while the owner is typing.
-        query = f'in:sent from:{owner} subject:"Twin request {request_id}"'
-        message_refs = service.users().messages().list(
-            userId="me", q=query, maxResults=5
-        ).execute().get("messages", [])
-        replies = []
-        for item in message_refs:
-            if notification_gmail_id and item["id"] == notification_gmail_id:
-                continue
-            raw_message = service.users().messages().get(
-                userId="me", id=item["id"], format="raw"
-            ).execute()
-            label_ids = set(raw_message.get("labelIds") or [])
-            if "SENT" not in label_ids or "DRAFT" in label_ids:
-                continue
-            raw = base64.urlsafe_b64decode(raw_message["raw"] + "==")
-            received = email_parser.message_from_bytes(raw)
-            sender = parseaddr(received.get("From", ""))[1].lower()
-            subject = str(make_header(decode_header(received.get("Subject", ""))))
-            match = REQUEST_ID_PATTERN.search(subject)
-            is_notification = received.get("X-Digital-Twin-Notification") == "true"
-            is_reply_subject = bool(re.match(r"^\s*(?:re|fw|fwd)\s*:", subject, re.IGNORECASE))
-            if (
-                sender == owner
-                and match
-                and match.group(1) == request_id
-                and not is_notification
-                and is_reply_subject
-            ):
-                reply = _message_text(received)
-                if reply:
-                    replies.append(reply)
-        if not replies:
-            with REPLY_CANDIDATE_LOCK:
-                _reply_candidate_cache.pop(request_id, None)
-            return None
-
-        # Even sent messages can take a moment to finish synchronizing across
-        # Gmail. Require the exact body to remain unchanged briefly.
-        candidate = max(replies, key=len)
-        return _stable_reply_candidate(request_id, candidate)
-    except HttpError as error:
-        if error.resp.status in (403, 429):
-            _gmail_retry_after = time.monotonic() + 120
-        print(f"Unable to read Hemanth's Gmail reply: {error}")
-    except Exception as error:
-        error_text = str(error)
-        auth_failed = (
-            "invalid_grant" in error_text
-            or "Gmail authorization is missing" in error_text
-            or "expired or revoked" in error_text
-        )
-        if auth_failed:
-            # Avoid flooding the console while the background watcher waits for
-            # the owner to complete the browser-based OAuth flow.
-            _gmail_retry_after = time.monotonic() + 900
-            if not _gmail_auth_warning_shown:
-                print(
-                    "Gmail authorization expired or was revoked. Reply checks are "
-                    "paused for 15 minutes. Run "
-                    "`uv run .\\1_foundations\\twin\\setup_gmail.py`, then restart "
-                    "the app."
-                )
-                _gmail_auth_warning_shown = True
-        else:
-            print(f"Unable to read Hemanth's Gmail reply: {error}")
     return None
 
 
@@ -620,6 +629,7 @@ def complete_request(
     request_id: str,
     answer: str,
     answer_validator: AnswerValidator | None = None,
+    source_message_id: str | None = None,
 ) -> dict[str, Any] | None:
     with REQUEST_LOCK:
         requests_data = load_requests()
@@ -638,6 +648,8 @@ def complete_request(
 
         request_data["answer"] = answer.strip()
         request_data["answered_at"] = _utc_now()
+        if source_message_id:
+            request_data["whatsapp_reply_message_id"] = source_message_id
         with REPLY_CANDIDATE_LOCK:
             _reply_candidate_cache.pop(request_id, None)
         if request_data["reply_channel"] == "email":
@@ -652,6 +664,50 @@ def complete_request(
             request_data["summary_update_skipped"] = "time-sensitive question"
         save_requests(requests_data)
         return request_data
+
+
+def process_whatsapp_webhook(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Match owner WhatsApp replies to pending requests by their eight-digit code."""
+    expected_sender = _normalize_phone_number(os.getenv("WHATSAPP_HUMAN_RECIPIENT", ""))
+    results: list[dict[str, Any]] = []
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            value = change.get("value", {})
+            for message in value.get("messages", []):
+                message_id = str(message.get("id") or "")
+                sender = _normalize_phone_number(str(message.get("from") or ""))
+                if not expected_sender or sender != expected_sender:
+                    results.append({"accepted": False, "reason": "unexpected sender"})
+                    continue
+                if message.get("type") != "text":
+                    results.append({"accepted": False, "reason": "text reply required"})
+                    continue
+                body = str(message.get("text", {}).get("body") or "").strip()
+                match = WHATSAPP_REPLY_PATTERN.match(body)
+                if not match:
+                    results.append({"accepted": False, "reason": "reply code missing"})
+                    continue
+                reply_code, answer = match.group(1).upper(), match.group(2).strip()
+                request_data = next(
+                    (
+                        item
+                        for item in load_requests()
+                        if str(item.get("reply_code") or "").upper() == reply_code
+                    ),
+                    None,
+                )
+                if not request_data:
+                    results.append({"accepted": False, "reply_code": reply_code, "reason": "unknown code"})
+                    continue
+                if request_data.get("answered_at"):
+                    duplicate = request_data.get("whatsapp_reply_message_id") == message_id
+                    results.append({"accepted": duplicate, "duplicate": duplicate, "reply_code": reply_code, "request_id": request_data.get("id"), "reason": "already answered"})
+                    continue
+                completed = complete_request(str(request_data["id"]), answer, source_message_id=message_id)
+                results.append({"accepted": bool(completed and completed.get("answer")), "reply_code": reply_code, "request_id": request_data.get("id")})
+                if completed:
+                    print(f"[WhatsApp answer] {reply_code} -> {completed.get('name', 'visitor')}: {answer}")
+    return results
 
 
 def process_owner_replies_once(answer_validator: AnswerValidator | None = None) -> None:
@@ -669,9 +725,8 @@ def process_owner_replies_once(answer_validator: AnswerValidator | None = None) 
                     continue
             except (TypeError, ValueError):
                 pass
-        answer = fetch_hemanth_reply(request_data["id"])
-        if answer:
-            complete_request(request_data["id"], answer, answer_validator)
+        # WhatsApp replies are completed immediately by the webhook. This worker
+        # only advances the two-minute timeout state.
 
 
 def start_reply_watcher(
