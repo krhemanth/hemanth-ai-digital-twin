@@ -34,7 +34,12 @@ from context import append_confirmed_answer
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_ROOT = BASE_DIR.parent
-for env_path in (APP_ROOT.parent / ".env", APP_ROOT / ".env", BASE_DIR / ".env"):
+for env_path in (
+    APP_ROOT.parent / ".env",
+    APP_ROOT / ".env",
+    BASE_DIR / ".env",
+    Path("/etc/secrets/.env"),
+):
     if env_path.exists():
         load_dotenv(env_path, override=True)
 

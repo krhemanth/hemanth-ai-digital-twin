@@ -47,6 +47,7 @@ for env_path in (
     BASE_DIR.parent.parent / ".env",
     BASE_DIR.parent / ".env",
     BASE_DIR / ".env",
+    Path("/etc/secrets/.env"),
 ):
     if env_path.exists():
         load_dotenv(env_path, override=True)
