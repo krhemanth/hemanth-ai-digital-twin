@@ -32,10 +32,9 @@ from context import append_confirmed_answer
 
 BASE_DIR = Path(__file__).resolve().parent
 APP_ROOT = BASE_DIR.parent
-for env_path in (BASE_DIR / ".env", APP_ROOT / ".env", APP_ROOT.parent / ".env"):
+for env_path in (APP_ROOT.parent / ".env", APP_ROOT / ".env", BASE_DIR / ".env"):
     if env_path.exists():
         load_dotenv(env_path, override=True)
-        break
 
 DATA_DIR = Path(os.getenv("TWIN_DATA_DIR", str(BASE_DIR))).expanduser()
 DATA_DIR.mkdir(parents=True, exist_ok=True)

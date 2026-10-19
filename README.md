@@ -24,6 +24,7 @@ files, OAuth tokens, or Pushover credentials.
 - `PUSHOVER_USER`
 - `PUSHOVER_TOKEN`
 - `OWNER_EMAIL`
+- `PRIVACY_CONTACT_EMAIL`: public contact address displayed on the Privacy Policy
 - `GMAIL_OAUTH_TOKEN_JSON`: the complete JSON contents of the locally authorized
   `gmail_token.json` file
 
@@ -41,3 +42,10 @@ Without attached storage, Hugging Face Space files are ephemeral. For durable ch
 follow-ups and confirmed answers, mount persistent storage at `/data` and add the
 Space variable `TWIN_DATA_DIR=/data`. Otherwise omit `TWIN_DATA_DIR`; the app will
 write temporary runtime state beside `app.py`.
+
+## Privacy Policy
+
+The application serves a public Privacy Policy at `/privacy-policy` in both local
+and hosted environments. Locally, the default URL is
+`http://127.0.0.1:7860/privacy-policy`. On Render, use
+`https://hemanth-ai-digital-twin.onrender.com/privacy-policy` after deployment.

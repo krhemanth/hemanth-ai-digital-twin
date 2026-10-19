@@ -58,6 +58,18 @@ body.dark gradio-app,
 
 footer, .built-with, .show-api, .api-docs { display: none !important; }
 
+.privacy-footer {
+  padding: 18px 0 4px;
+  text-align: center;
+  font-size: 0.9rem;
+}
+
+.privacy-footer a {
+  color: #176b5b;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .gradio-container {
   width: min(100%, 1040px) !important;
   margin: 0 auto !important;

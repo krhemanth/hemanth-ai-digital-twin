@@ -18,6 +18,8 @@ services:
         sync: false
       - key: OWNER_EMAIL
         sync: false
+      - key: PRIVACY_CONTACT_EMAIL
+        value: hemanthdse@gmail.com
       - key: GMAIL_OAUTH_TOKEN_JSON
         sync: false
       - key: GMAIL_ALLOW_INTERACTIVE_OAUTH

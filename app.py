@@ -14,7 +14,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import gradio as gr
+import uvicorn
 from dotenv import load_dotenv
+from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from openai import OpenAI
 
 from context import get_profile_context, get_system_prompt
@@ -37,14 +40,20 @@ from tools import (
 
 
 BASE_DIR = Path(__file__).resolve().parent
-for env_path in (BASE_DIR / ".env", BASE_DIR.parent / ".env", BASE_DIR.parent.parent / ".env"):
+for env_path in (
+    BASE_DIR.parent.parent / ".env",
+    BASE_DIR.parent / ".env",
+    BASE_DIR / ".env",
+):
     if env_path.exists():
         load_dotenv(env_path, override=True)
-        break
 
 CHAT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini")
 GUARD_MODEL = os.getenv("OPENAI_GUARD_MODEL", "gpt-5.4-nano")
 APP_VERSION = "2026-09-23.14"
+PRIVACY_CONTACT_EMAIL = os.getenv(
+    "PRIVACY_CONTACT_EMAIL", os.getenv("OWNER_EMAIL", "hemanthdse@gmail.com")
+)
 MAX_TOOL_ROUNDS = 5
 MAX_INPUT_CHARACTERS = 2000
 RATE_LIMIT_WINDOW_SECONDS = 120
@@ -1196,25 +1205,120 @@ def create_demo() -> gr.ChatInterface:
             queue=False,
             show_progress="hidden",
         )
+        gr.HTML(
+            '<div class="privacy-footer">'
+            '<a href="/privacy-policy" target="_blank" rel="noopener noreferrer">'
+            "Privacy Policy</a></div>"
+        )
     return demo
+
+
+def privacy_policy_html() -> str:
+    contact_email = PRIVACY_CONTACT_EMAIL.replace("&", "&amp;").replace(
+        '"', "&quot;"
+    ).replace("<", "&lt;").replace(">", "&gt;")
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy Policy | Hemanth AI Digital Twin</title>
+  <meta name="description" content="Privacy Policy for Hemanth AI Digital Twin">
+  <style>
+    :root {{ color-scheme: light; --ink:#18212f; --muted:#526173; --line:#dce3ea; --accent:#176b5b; }}
+    * {{ box-sizing:border-box; }}
+    body {{ margin:0; background:#f5f7f9; color:var(--ink); font:16px/1.65 system-ui,-apple-system,"Segoe UI",sans-serif; }}
+    main {{ width:min(860px,calc(100% - 32px)); margin:40px auto; padding:clamp(24px,5vw,56px); background:#fff; border:1px solid var(--line); border-radius:18px; box-shadow:0 12px 34px rgba(22,33,47,.08); }}
+    h1 {{ margin:0 0 4px; font-size:clamp(2rem,5vw,3rem); line-height:1.15; }}
+    h2 {{ margin:2rem 0 .5rem; font-size:1.3rem; }}
+    p,li {{ color:var(--muted); }}
+    a {{ color:var(--accent); }}
+    .updated {{ margin-top:0; }}
+    .notice {{ padding:16px 18px; border-left:4px solid var(--accent); background:#eef8f5; border-radius:6px; }}
+    footer {{ display:block !important; margin-top:2.5rem; padding-top:1rem; border-top:1px solid var(--line); }}
+  </style>
+</head>
+<body>
+<main>
+  <h1>Privacy Policy</h1>
+  <p class="updated"><strong>Hemanth AI Digital Twin</strong><br>Effective date: October 18, 2026</p>
+  <p class="notice">This policy explains how the Hemanth AI Digital Twin website and its optional human-assistance and WhatsApp communication features handle personal information.</p>
+
+  <h2>Information we collect</h2>
+  <p>When you use the chat, we process the messages you submit and the responses generated for you. The application may also process your IP address and browser user-agent to create a hashed browser identifier, maintain conversation continuity, and enforce rate limits. It stores no more than the latest 100 messages associated with that identifier.</p>
+  <p>If you request human assistance, you may choose to provide your name, email address, organization, project details, questions, and preferred reply channel. The application may retain the request, delivery status, and the response supplied by Hemanth. It may also record unanswered questions to improve the verified information available to the assistant.</p>
+  <p>If WhatsApp communication is enabled, we process the phone number, profile name, message content, message identifiers, timestamps, and delivery-status information supplied by WhatsApp so messages can be received, displayed, answered, and troubleshot.</p>
+
+  <h2>How we use information</h2>
+  <ul>
+    <li>To answer questions about Hemanth using the digital-twin service.</li>
+    <li>To preserve chat continuity, prevent abuse, and diagnose service problems.</li>
+    <li>To route an explicitly requested human follow-up and deliver the response.</li>
+    <li>To send and receive WhatsApp messages when that channel is configured.</li>
+    <li>To maintain and improve the accuracy and safety of the service.</li>
+  </ul>
+
+  <h2>Service providers and disclosures</h2>
+  <p>Chat content is sent to OpenAI for AI processing. Depending on the feature you request, relevant information may also be processed by Meta and WhatsApp, Google Gmail, Pushover, the email provider, and the application hosting provider (including Render). These providers process information under their own terms and privacy policies. Information is also shared with Hemanth when you explicitly request human assistance or a personal response.</p>
+  <p>We do not sell personal information. We may disclose information if required by law, to protect users or the service, or in connection with a legitimate security investigation.</p>
+
+  <h2>Storage, security, and retention</h2>
+  <p>Application records are stored in local application storage or an attached hosting volume. Email and notification records may also remain with the relevant communication provider. The application uses access controls and secret-based credentials, but no Internet service can guarantee absolute security.</p>
+  <p>The application does not currently apply a fixed automatic deletion period to saved chats, contact requests, or unanswered questions. Records are retained until they are no longer needed for the purposes described above or are manually deleted in response to a valid request. Hosting environments without persistent storage may erase local records when the service is rebuilt or restarted.</p>
+
+  <h2>Your choices and deletion requests</h2>
+  <p>You do not need to provide a name or email address to ask ordinary questions. Do not submit sensitive credentials, financial information, medical information, or other information you do not want processed by the service.</p>
+  <p>You may request access to or deletion of identifiable information you provided by emailing <a href="mailto:{contact_email}?subject=Digital%20Twin%20Privacy%20Request">{contact_email}</a> with the subject “Digital Twin Privacy Request.” Include enough information to identify the relevant conversation or contact request. Identity may be verified before a request is completed. Some information may be retained when required for security, legal compliance, or resolving disputes.</p>
+
+  <h2>Children</h2>
+  <p>This professional-profile service is not directed to children under 13, and we do not knowingly solicit personal information from children.</p>
+
+  <h2>Changes to this policy</h2>
+  <p>This policy may be updated when the application or its integrations change. The effective date above will be updated when material changes are published.</p>
+
+  <h2>Contact</h2>
+  <p>Questions about this policy or the application’s data practices can be sent to <a href="mailto:{contact_email}">{contact_email}</a>.</p>
+  <footer><a href="/">Return to Hemanth AI Digital Twin</a></footer>
+</main>
+</body>
+</html>"""
+
+
+def create_web_app() -> FastAPI:
+    web_app = FastAPI(title="Hemanth AI Digital Twin")
+
+    @web_app.get("/privacy-policy", response_class=HTMLResponse, include_in_schema=False)
+    @web_app.get("/privacy-policy/", response_class=HTMLResponse, include_in_schema=False)
+    def privacy_policy() -> HTMLResponse:
+        return HTMLResponse(privacy_policy_html())
+
+    demo = create_demo()
+    demo = demo.queue(default_concurrency_limit=16, max_size=64)
+    return gr.mount_gradio_app(
+        web_app,
+        demo,
+        path="/",
+        footer_links=[],
+        theme=gr.themes.Base(),
+        css=CSS,
+        js=JS,
+    )
+
+
+app = create_web_app()
 
 
 if __name__ == "__main__":
     print(f"Starting Hemanth Digital Twin app version {APP_VERSION}")
-    demo = create_demo()
     is_hosted = bool(os.getenv("RENDER") or os.getenv("SPACE_ID"))
     default_inbrowser = "false" if is_hosted else "true"
     server_name = os.getenv(
         "GRADIO_SERVER_NAME", "0.0.0.0" if is_hosted else "127.0.0.1"
     )
     server_port = int(os.getenv("PORT", os.getenv("GRADIO_SERVER_PORT", "7860")))
-    demo.queue(default_concurrency_limit=16, max_size=64).launch(
-        server_name=server_name,
-        server_port=server_port,
-        inbrowser=os.getenv("GRADIO_INBROWSER", default_inbrowser).lower() == "true",
-        share=os.getenv("GRADIO_SHARE", "false").lower() == "true",
-        footer_links=[],
-        theme=gr.themes.Base(),
-        css=CSS,
-        js=JS,
+    uvicorn.run(
+        app,
+        host=server_name,
+        port=server_port,
+        log_level="info",
     )
